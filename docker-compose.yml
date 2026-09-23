@@ -1,0 +1,99 @@
+# демонстрирует: локальный запуск всего стека одной командой; профиль sim — телефония без SIP-транка
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ai_support
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ai_support"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: ./backend
+    command: python /db/migrate.py up
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/ai_support
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:-app_secret}
+    volumes:
+      - ./db:/db
+    depends_on:
+      db:
+        condition: service_healthy
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql://app_user:${POSTGRES_APP_PASSWORD:-app_secret}@db:5432/ai_support
+      DEMO_USER_ID: ${DEMO_USER_ID:-00000000-0000-0000-0000-000000000001}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-dev_webhook_secret}
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+  asterisk:
+    build: ./telephony/asterisk
+    command: ["sh", "-c", "mkdir -p /var/spool/asterisk/monitor /var/spool/asterisk/recording && chown asterisk:asterisk /var/spool/asterisk/monitor /var/spool/asterisk/recording && exec /usr/sbin/asterisk -vvvdddf -T -W -U asterisk -p"]
+    ports:
+      - "8088:8088"            # ARI HTTP + WebSocket
+      - "5060:5060/udp"        # SIP
+      - "10000-10050:10000-10050/udp"  # RTP
+    volumes:
+      - ./telephony/asterisk:/etc/asterisk:ro   # конфиг поверх VOLUME-директории образа
+      - recordings:/var/spool/asterisk/recording  # ARI-записи (telephony раздаёт их с :8090)
+
+  telephony:
+    build: ./telephony
+    environment:
+      ARI_URL: http://asterisk:8088
+      ARI_USER: ${ARI_USER:-ari}
+      ARI_PASSWORD: ${ARI_PASSWORD:-ari_secret}
+      BACKEND_URL: http://backend:8000
+      STT_PROVIDER: ${STT_PROVIDER:-mock}
+      STT_BASE_URL: ${STT_BASE_URL:-https://api.openai.com/v1}
+      STT_API_KEY: ${STT_API_KEY:-}
+      TTS_PROVIDER: ${TTS_PROVIDER:-mock}
+      TTS_BASE_URL: ${TTS_BASE_URL:-https://api.openai.com/v1}
+      TTS_API_KEY: ${TTS_API_KEY:-}
+      RTP_LISTEN_PORT: 10000
+    ports:
+      - "10100:10000/udp"      # RTP ExternalMedia -> обработчик (внутри сети: telephony:10000)
+      - "8090:8090"            # отдача записей разговоров
+    volumes:
+      - recordings:/recordings
+    depends_on:
+      - asterisk
+      - backend
+
+  sim:
+    build: ./telephony
+    profiles: ["sim"]
+    volumes:
+      - ./scripts:/scripts
+    entrypoint: ["python", "/scripts/sim_call.py"]
+    depends_on:
+      - telephony
+
+volumes:
+  pgdata:
+  recordings:
